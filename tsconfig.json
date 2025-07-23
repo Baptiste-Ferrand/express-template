@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    // Cible JS
+    "target": "ES2020",
+    // Générer du CommonJS plutôt que NodeNext
+    "module": "CommonJS",
+    // Résolution des modules en mode Node (là où on utilise module:CommonJS)
+    "moduleResolution": "Node",
+    // Où mettre le résultat compilé
+    "outDir": "dist",
+    // Racine de ton code source
+    "rootDir": ".",
+    // Activer les contrôles stricts
+    "strict": true,
+    // Pour importer sans import * as…
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  // Inclure tes sources TS et ton main.ts
+  "include": ["src", "main.ts"]
+}
