@@ -14,7 +14,11 @@ jobs:
       - name: Get latest commit message
         id: get_commit
         run: |
-          echo "COMMIT_MSG=$(git log -1 --pretty=%B)" >> $GITHUB_ENV
+          {
+            echo 'COMMIT_MSG<<EOF'
+            git log -1 --pretty=%B
+            echo 'EOF'
+          } >> $GITHUB_ENV
 
       - name: Extract version from commit message
         id: extract_version
