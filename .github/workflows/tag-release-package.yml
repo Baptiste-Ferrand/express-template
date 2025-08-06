@@ -1,0 +1,235 @@
+name: Version, Tag, Release & Package
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - develop
+
+jobs:
+  versioning-and-release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      full_tag: ${{ steps.version.outputs.full_tag }}
+      is_latest: ${{ steps.version.outputs.is_latest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current version from package.json
+        id: get_version
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          echo "CURRENT_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Increment version based on source branch
+        id: increment_version
+        run: |
+          CURRENT_VERSION=${{ env.CURRENT_VERSION }}
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          TARGET_BRANCH="${{ github.base_ref }}"
+          
+          CLEAN_VERSION=$(echo $CURRENT_VERSION | sed 's/-pre-prod//')
+          
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_VERSION"
+          
+          case $BRANCH_NAME in
+            feat/*|feature/*)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            fix/*|hotfix/*)
+              PATCH=$((PATCH + 1))
+              ;;
+            *breaking*|*major*)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+          esac
+          
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          
+          if [[ "$TARGET_BRANCH" == "develop" ]]; then
+            FULL_VERSION="${NEW_VERSION}-pre-prod"
+            IS_LATEST="false"
+          elif [[ "$TARGET_BRANCH" == "main" ]]; then
+            FULL_VERSION="${NEW_VERSION}"
+            IS_LATEST="true"
+          fi
+          
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+          echo "IS_LATEST=$IS_LATEST" >> $GITHUB_ENV
+
+      - name: Extract changelog from PR description
+        id: extract_changelog
+        run: |
+          PR_BODY='${{ github.event.pull_request.body }}'
+          
+          if echo "$PR_BODY" | grep -q "#changelog"; then
+            CHANGELOG=$(echo "$PR_BODY" | sed -n '/#changelog/,$p' | sed '1d' | sed '/^[[:space:]]*$/d')
+          else
+            CHANGELOG="- Update to version ${{ env.FULL_VERSION }}"
+          fi
+          
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="- Update to version ${{ env.FULL_VERSION }}"
+          fi
+          
+          {
+            echo 'CHANGELOG<<EOF'
+            echo "$CHANGELOG"
+            echo 'EOF'
+          } >> $GITHUB_ENV
+
+      - name: Update version in package.json
+        id: version
+        run: |
+          jq --arg version "${{ env.FULL_VERSION }}" '.version = $version' package.json > tmp.json && mv tmp.json package.json
+          
+          echo "version=${{ env.NEW_VERSION }}" >> $GITHUB_OUTPUT
+          echo "full_tag=${{ env.FULL_VERSION }}" >> $GITHUB_OUTPUT
+          echo "is_latest=${{ env.IS_LATEST }}" >> $GITHUB_OUTPUT
+
+      - name: Commit and push updated package.json
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git add package.json
+          git commit -m "Update version to ${{ env.FULL_VERSION }}"
+          git push origin ${{ github.ref_name }}
+
+      - name: Remove old latest tag
+        if: env.IS_LATEST == 'true'
+        run: |
+          if git tag -l | grep -q "^latest$"; then
+            git tag -d latest || true
+            git push origin :refs/tags/latest || true
+          fi
+
+      - name: Create Git tags
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git tag ${{ env.FULL_VERSION }}
+          git push origin ${{ env.FULL_VERSION }}
+          
+          if [[ "${{ env.IS_LATEST }}" == "true" ]]; then
+            git tag latest
+            git push origin latest
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.FULL_VERSION }}
+          name: "Release ${{ env.FULL_VERSION }}"
+          body: |
+            ## 📋 Changelog
+            
+            ${{ env.CHANGELOG }}
+            
+            ## 🏷️ Tags
+            - **Version**: `${{ env.FULL_VERSION }}`${{ env.IS_LATEST == 'true' && format('{0}- **Latest**: `latest`', '
+            ') || '' }}
+            
+            ## 📦 Docker Package
+            
+            ```bash
+            # Pull specific version
+            docker pull ghcr.io/baptiste-ferrand/express-template:${{ env.FULL_VERSION }}
+            ${{ env.IS_LATEST == 'true' && format('{0}# Pull latest stable{0}docker pull ghcr.io/baptiste-ferrand/express-template:latest', '
+            ') || '' }}
+            ```
+            
+            ## ℹ️ Information
+            
+            - **Source branch**: `${{ github.event.pull_request.head.ref }}`
+            - **Target branch**: `${{ github.base_ref }}`
+            - **Release type**: ${{ env.IS_LATEST == 'true' && '**Stable** 🎯' || '**Pre-production** 🧪' }}
+            - **PR author**: @${{ github.event.pull_request.user.login }}
+          prerelease: ${{ env.IS_LATEST != 'true' }}
+          make_latest: ${{ env.IS_LATEST == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-deploy-image:
+    needs: versioning-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare Docker tags
+        id: prepare_tags
+        run: |
+          TAGS="ghcr.io/baptiste-ferrand/express-template:${{ needs.versioning-and-release.outputs.full_tag }}"
+
+          if [[ "${{ needs.versioning-and-release.outputs.is_latest }}" == "true" ]]; then
+            TAGS="${TAGS},ghcr.io/baptiste-ferrand/express-template:latest"
+          fi
+          
+          echo "DOCKER_TAGS=${TAGS}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64/v8
+          tags: ${{ env.DOCKER_TAGS }}
+          labels: |
+            org.opencontainers.image.title=Template Release Application
+            org.opencontainers.image.description=Application with automated versioning
+            org.opencontainers.image.version=${{ needs.versioning-and-release.outputs.full_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.source=${{ github.event.repository.clone_url }}
+
+      - name: Deployment summary
+        run: |
+          echo "## 🎉 Deployment successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Package created" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`${{ needs.versioning-and-release.outputs.full_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.versioning-and-release.outputs.is_latest }}" == "true" ]]; then
+            echo "- **Latest**: \`latest\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🐳 Docker commands" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ghcr.io/baptiste-ferrand/express-template:${{ needs.versioning-and-release.outputs.full_tag }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.versioning-and-release.outputs.is_latest }}" == "true" ]]; then
+            echo "docker pull ghcr.io/baptiste-ferrand/express-template:latest" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 package.json" >> $GITHUB_STEP_SUMMARY
+          echo "- Version in package.json updated automatically" >> $GITHUB_STEP_SUMMARY
