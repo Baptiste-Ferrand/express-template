@@ -140,7 +140,7 @@ jobs:
           # Décoder le changelog
           CHANGELOG_DECODED=$(echo "$CHANGELOG_B64" | base64 -d)
           
-          # Créer le JSON payload pour la release
+          # Créer le JSON payload pour la release (en corrigeant les types)
           RELEASE_PAYLOAD=$(jq -n \
             --arg tag_name "${{ env.FULL_VERSION }}" \
             --arg name "Release ${{ env.FULL_VERSION }}" \
@@ -149,23 +149,39 @@ jobs:
             --arg source_branch "${{ github.event.pull_request.head.ref }}" \
             --arg target_branch "${{ github.base_ref }}" \
             --arg pr_author "${{ github.event.pull_request.user.login }}" \
-            --argjson is_latest "$([[ "${{ env.IS_LATEST }}" == "true" ]] && echo true || echo false)" \
+            --arg is_latest_str "$([[ "${{ env.IS_LATEST }}" == "true" ]] && echo "true" || echo "false")" \
             --argjson prerelease "$([[ "${{ env.IS_LATEST }}" != "true" ]] && echo true || echo false)" \
             '{
               tag_name: $tag_name,
               name: $name,
-              body: ("## 📋 Changelog\n\n" + $changelog + "\n\n## 🏷️ Tags\n- **Version**: `" + $full_version + "`" + (if $is_latest then "\n- **Latest**: `latest`" else "" end) + "\n\n## 📦 Docker Package\n\n```bash\n# Pull specific version\ndocker pull ghcr.io/baptiste-ferrand/express-template:" + $full_version + (if $is_latest then "\n# Pull latest stable\ndocker pull ghcr.io/baptiste-ferrand/express-template:latest" else "" end) + "\n```\n\n## ℹ️ Information\n\n- **Source branch**: `" + $source_branch + "`\n- **Target branch**: `" + $target_branch + "`\n- **Release type**: " + (if $is_latest then "**Stable** 🎯" else "**Pre-production** 🧪" end) + "\n- **PR author**: @" + $pr_author),
+              body: ("## 📋 Changelog\n\n" + $changelog + "\n\n## 🏷️ Tags\n- **Version**: `" + $full_version + "`" + (if ($is_latest_str == "true") then "\n- **Latest**: `latest`" else "" end) + "\n\n## 📦 Docker Package\n\n```bash\n# Pull specific version\ndocker pull ghcr.io/baptiste-ferrand/express-template:" + $full_version + (if ($is_latest_str == "true") then "\n# Pull latest stable\ndocker pull ghcr.io/baptiste-ferrand/express-template:latest" else "" end) + "\n```\n\n## ℹ️ Information\n\n- **Source branch**: `" + $source_branch + "`\n- **Target branch**: `" + $target_branch + "`\n- **Release type**: " + (if ($is_latest_str == "true") then "**Stable** 🎯" else "**Pre-production** 🧪" end) + "\n- **PR author**: @" + $pr_author),
               prerelease: $prerelease,
-              make_latest: $is_latest
+              make_latest: $is_latest_str
             }')
           
+          echo "🚀 Creating release with payload:"
+          echo "$RELEASE_PAYLOAD" | jq '.'
+          
           # Créer la release via l'API GitHub
-          curl -X POST \
+          RESPONSE=$(curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
-            -d "$RELEASE_PAYLOAD"
+            -d "$RELEASE_PAYLOAD")
+          
+          echo "🎯 GitHub API Response:"
+          echo "$RESPONSE" | jq '.'
+          
+          # Vérifier si la release a été créée avec succès
+          if echo "$RESPONSE" | jq -e '.html_url' > /dev/null; then
+            RELEASE_URL=$(echo "$RESPONSE" | jq -r '.html_url')
+            echo "✅ Release created successfully: $RELEASE_URL"
+          else
+            echo "❌ Failed to create release"
+            echo "$RESPONSE"
+            exit 1
+          fi
 
   build-and-deploy-image:
     needs: versioning-and-release
