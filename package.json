@@ -1,6 +1,6 @@
 {
   "name": "express-template",
-  "version": "0.2.0-pre-prod",
+  "version": "0.3.0-pre-prod",
   "description": "Your project description",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only main.ts",
