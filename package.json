@@ -1,4 +1,7 @@
 {
+  "name": "express-template",
+  "version": "0.1.0",
+  "description": "Your project description",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only main.ts",
     "build": "tsc",
