@@ -25,10 +25,14 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get current version from package.json
+      - name: Install toml
+        run: |
+          python -m pip install toml
+
+      - name: Get current version from pyproject.toml
         id: get_version
         run: |
-          VERSION=$(jq -r '.version' package.json)
+          VERSION=$(python -c "import toml; print(toml.load('pyproject.toml')['project']['version'])")
           echo "CURRENT_VERSION=${VERSION}" >> $GITHUB_ENV
 
       - name: Increment version based on source branch
@@ -40,24 +44,20 @@ jobs:
           
           CLEAN_VERSION=$(echo $CURRENT_VERSION | sed 's/-pre-prod//')
           
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_VERSION"
-          
           case $BRANCH_NAME in
             feat/*|feature/*)
-              MINOR=$((MINOR + 1))
-              PATCH=0
+              NEW_VERSION=$(echo $CLEAN_VERSION | awk -F. -v OFS=. '{$2++; $3=0; print $0}')
               ;;
             fix/*|hotfix/*)
-              PATCH=$((PATCH + 1))
+              NEW_VERSION=$(echo $CLEAN_VERSION | awk -F. -v OFS=. '{$3++; print $0}')
               ;;
             *breaking*|*major*)
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
-              PATCH=0
+              NEW_VERSION=$(echo $CLEAN_VERSION | awk -F. -v OFS=. '{$1++; $2=0; $3=0; print $0}')
+              ;;
+            *)
+              NEW_VERSION=$CLEAN_VERSION
               ;;
           esac
-          
-          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           
           if [[ "$TARGET_BRANCH" == "develop" ]]; then
             FULL_VERSION="${NEW_VERSION}-pre-prod"
@@ -74,7 +74,14 @@ jobs:
       - name: Extract changelog from PR description
         id: extract_changelog
         run: |
-          PR_BODY='${{ github.event.pull_request.body }}'
+          # Encoder le PR body en base64 pour éviter tous les problèmes de caractères spéciaux
+          PR_BODY_B64=$(echo '${{ github.event.pull_request.body }}' | base64 -w 0)
+          echo "PR_BODY_B64=${PR_BODY_B64}" >> $GITHUB_ENV
+          
+      - name: Process changelog
+        run: |
+          # Décoder le PR body depuis base64 et nettoyer
+          PR_BODY=$(echo "$PR_BODY_B64" | base64 -d | tr -d '\r')
           
           if echo "$PR_BODY" | grep -q "#changelog"; then
             CHANGELOG=$(echo "$PR_BODY" | sed -n '/#changelog/,$p' | sed '1d' | sed '/^[[:space:]]*$/d')
@@ -86,27 +93,26 @@ jobs:
             CHANGELOG="- Update to version ${{ env.FULL_VERSION }}"
           fi
           
-          {
-            echo 'CHANGELOG<<EOF'
-            echo "$CHANGELOG"
-            echo 'EOF'
-          } >> $GITHUB_ENV
+          # Nettoyer le changelog final et l'encoder en base64
+          CHANGELOG_CLEAN=$(echo "$CHANGELOG" | tr -d '\r' | sed 's/[[:space:]]*$//')
+          CHANGELOG_B64=$(echo "$CHANGELOG_CLEAN" | base64 -w 0)
+          
+          echo "CHANGELOG_B64=${CHANGELOG_B64}" >> $GITHUB_ENV
 
-      - name: Update version in package.json
+      - name: Update version in pyproject.toml
         id: version
         run: |
-          jq --arg version "${{ env.FULL_VERSION }}" '.version = $version' package.json > tmp.json && mv tmp.json package.json
-          
+          python -c "import toml; data = toml.load('pyproject.toml'); data['project']['version'] = '${{ env.FULL_VERSION }}'; toml.dump(data, open('pyproject.toml', 'w'))"
           echo "version=${{ env.NEW_VERSION }}" >> $GITHUB_OUTPUT
           echo "full_tag=${{ env.FULL_VERSION }}" >> $GITHUB_OUTPUT
           echo "is_latest=${{ env.IS_LATEST }}" >> $GITHUB_OUTPUT
 
-      - name: Commit and push updated package.json
+      - name: Commit and push updated pyproject.toml
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
-          git add package.json
+          git add pyproject.toml
           git commit -m "Update version to ${{ env.FULL_VERSION }}"
           git push origin ${{ github.ref_name }}
 
@@ -132,38 +138,73 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.FULL_VERSION }}
-          name: "Release ${{ env.FULL_VERSION }}"
-          body: |
-            ## 📋 Changelog
-            
-            ${{ env.CHANGELOG }}
-            
-            ## 🏷️ Tags
-            - **Version**: `${{ env.FULL_VERSION }}`${{ env.IS_LATEST == 'true' && format('{0}- **Latest**: `latest`', '
-            ') || '' }}
-            
-            ## 📦 Docker Package
-            
-            ```bash
-            # Pull specific version
-            docker pull ghcr.io/baptiste-ferrand/express-template:${{ env.FULL_VERSION }}
-            ${{ env.IS_LATEST == 'true' && format('{0}# Pull latest stable{0}docker pull ghcr.io/baptiste-ferrand/express-template:latest', '
-            ') || '' }}
-            ```
-            
-            ## ℹ️ Information
-            
-            - **Source branch**: `${{ github.event.pull_request.head.ref }}`
-            - **Target branch**: `${{ github.base_ref }}`
-            - **Release type**: ${{ env.IS_LATEST == 'true' && '**Stable** 🎯' || '**Pre-production** 🧪' }}
-            - **PR author**: @${{ github.event.pull_request.user.login }}
-          prerelease: ${{ env.IS_LATEST != 'true' }}
-          make_latest: ${{ env.IS_LATEST == 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Décoder le changelog pour l'utiliser dans la release
+          CHANGELOG_DECODED=$(echo "$CHANGELOG_B64" | base64 -d)
+          
+          # Créer le body de la release
+          RELEASE_BODY="## 📋 Changelog
+
+          ${CHANGELOG_DECODED}
+
+          ## 🏷️ Tags
+          - **Version**: \`${{ env.FULL_VERSION }}\`"
+          
+          if [[ "${{ env.IS_LATEST }}" == "true" ]]; then
+            RELEASE_BODY="${RELEASE_BODY}
+          - **Latest**: \`latest\`"
+          fi
+          
+          RELEASE_BODY="${RELEASE_BODY}
+
+          ## 📦 Docker Package
+
+          \`\`\`bash
+          # Pull specific version
+          docker pull ghcr.io/baptiste-ferrand/express-template:${{ env.FULL_VERSION }}"
+          
+          if [[ "${{ env.IS_LATEST }}" == "true" ]]; then
+            RELEASE_BODY="${RELEASE_BODY}
+          # Pull latest stable
+          docker pull ghcr.io/baptiste-ferrand/express-template:latest"
+          fi
+          
+          RELEASE_BODY="${RELEASE_BODY}
+          \`\`\`
+
+          ## ℹ️ Information
+
+          - **Source branch**: \`${{ github.event.pull_request.head.ref }}\`
+          - **Target branch**: \`${{ github.base_ref }}\`
+          - **Release type**: "
+          
+          if [[ "${{ env.IS_LATEST }}" == "true" ]]; then
+            RELEASE_BODY="${RELEASE_BODY}**Stable** 🎯"
+          else
+            RELEASE_BODY="${RELEASE_BODY}**Pre-production** 🧪"
+          fi
+          
+          RELEASE_BODY="${RELEASE_BODY}
+          - **PR author**: @${{ github.event.pull_request.user.login }}"
+          
+          # Utiliser l'API GitHub pour créer la release
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "$(jq -n \
+              --arg tag_name "${{ env.FULL_VERSION }}" \
+              --arg name "Release ${{ env.FULL_VERSION }}" \
+              --arg body "$RELEASE_BODY" \
+              --argjson prerelease "$([[ "${{ env.IS_LATEST }}" != "true" ]] && echo true || echo false)" \
+              --argjson make_latest "$([[ "${{ env.IS_LATEST }}" == "true" ]] && echo true || echo false)" \
+              '{
+                tag_name: $tag_name,
+                name: $name,
+                body: $body,
+                prerelease: $prerelease,
+                make_latest: $make_latest
+              }')"
 
   build-and-deploy-image:
     needs: versioning-and-release
@@ -206,8 +247,8 @@ jobs:
           platforms: linux/amd64,linux/arm64/v8
           tags: ${{ env.DOCKER_TAGS }}
           labels: |
-            org.opencontainers.image.title=Template Release Application
-            org.opencontainers.image.description=Application with automated versioning
+            org.opencontainers.image.title=Track&Train API
+            org.opencontainers.image.description=API for Track&Train application
             org.opencontainers.image.version=${{ needs.versioning-and-release.outputs.full_tag }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
@@ -231,5 +272,5 @@ jobs:
           fi
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 package.json" >> $GITHUB_STEP_SUMMARY
-          echo "- Version in package.json updated automatically" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 pyproject.toml" >> $GITHUB_STEP_SUMMARY
+          echo "- Version in pyproject.toml updated automatically" >> $GITHUB_STEP_SUMMARY
